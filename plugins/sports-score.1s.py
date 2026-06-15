@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 NBA_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
 WORLD_CUP_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
 WORLD_CUP_STANDINGS_URL = "https://site.api.espn.com/apis/v2/sports/soccer/fifa.world/standings?season=2026"
+WORLD_CUP_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary"
 DEFAULT_STATE_DIR = Path.home() / "Library/Application Support/SportsIsland"
 STATE_DIR = Path(os.environ.get("SPORTS_ISLAND_STATE_DIR", DEFAULT_STATE_DIR))
 STATE_FILE = STATE_DIR / "channel"
@@ -257,6 +259,92 @@ def soccer_situation(event):
     return f"{leader}暂时领先"
 
 
+def clock_minute(clock):
+    try:
+        return int(str(clock).split("+")[0].rstrip("'"))
+    except (TypeError, ValueError):
+        return None
+
+
+def key_event_message(item):
+    event_type = item.get("type", {}).get("type", "")
+    minute = item.get("clock", {}).get("displayValue", "")
+    minute_prefix = f"{minute}·" if minute else ""
+    team = item.get("team", {})
+    team_name = TEAM_NAMES_ZH.get(team.get("displayName"), team.get("displayName", ""))
+    participants = item.get("participants") or []
+    player = participants[0].get("athlete", {}).get("displayName", "") if participants else ""
+    subject = " ".join(part for part in (team_name, player) if part)
+
+    if "goal" in event_type:
+        action = "乌龙球" if "own-goal" in event_type else "破门"
+        return f"{minute_prefix}{subject}{action}", "goal"
+    if "red-card" in event_type or "second-yellow" in event_type:
+        return f"{minute_prefix}{subject}染红", "red"
+    if "yellow-card" in event_type:
+        return f"{minute_prefix}{subject}黄牌", "yellow"
+    return None, None
+
+
+def stoppage_message(event, summary):
+    display_clock = event.get("status", {}).get("displayClock", "")
+    current_minute = clock_minute(display_clock)
+    if current_minute not in {45, 90, 105, 120} and "+" not in display_clock:
+        return None
+
+    for item in reversed(summary.get("commentary", [])):
+        text = item.get("text") or ""
+        match = re.search(r"announced (\d+) minutes? of added time", text, re.IGNORECASE)
+        if not match:
+            continue
+        period = "上半场" if current_minute == 45 else "下半场"
+        if current_minute in {105, 120}:
+            period = "加时赛"
+        return f"{period}补时{match.group(1)}分钟"
+    return None
+
+
+def soccer_event_messages(event, summary):
+    if not summary:
+        return []
+
+    state = event.get("status", {}).get("type", {}).get("state")
+    current_minute = clock_minute(event.get("status", {}).get("displayClock"))
+    latest = {}
+
+    for item in summary.get("keyEvents", []):
+        message, category = key_event_message(item)
+        if not message:
+            continue
+        event_minute = clock_minute(item.get("clock", {}).get("displayValue"))
+        if (
+            state == "in"
+            and category == "yellow"
+            and current_minute is not None
+            and event_minute is not None
+            and current_minute - event_minute > 5
+        ):
+            continue
+        latest[category] = message
+
+    messages = [latest[key] for key in ("goal", "red") if key in latest]
+    stoppage = stoppage_message(event, summary) if state == "in" else None
+    if stoppage:
+        messages.append(stoppage)
+    if "yellow" in latest:
+        messages.append(latest["yellow"])
+    return messages
+
+
+def all_key_event_messages(summary):
+    messages = []
+    for item in summary.get("keyEvents", []):
+        message, _ = key_event_message(item)
+        if message:
+            messages.append(message)
+    return messages
+
+
 def standings_index(payload):
     result = {}
     for group in payload.get("children", []):
@@ -316,19 +404,36 @@ def fetch_world_cup():
             if event.get("id") not in seen:
                 events.append(event)
                 seen.add(event.get("id"))
+    events = sorted(events, key=event_priority)
     standings = standings_index(curl_json(WORLD_CUP_STANDINGS_URL))
-    return sorted(events, key=event_priority), standings
+    summaries = {}
+    if events:
+        featured = events[0]
+        state = featured.get("status", {}).get("type", {}).get("state")
+        if state in {"in", "post"}:
+            try:
+                summaries[str(featured.get("id"))] = curl_json(
+                    f"{WORLD_CUP_SUMMARY_URL}?event={featured.get('id')}"
+                )
+            except Exception:
+                pass
+    return events, standings, summaries
 
 
-def world_cup_messages(events, table):
+def world_cup_messages(events, table, summaries):
     featured = events[0] if events else None
     score = soccer_title(featured) if featured else "世界杯 · 今日无比赛"
-    situation = soccer_situation(featured) if featured else None
-    return [score, situation] if featured else [score]
+    if not featured:
+        return [score]
+    event_messages = soccer_event_messages(
+        featured, summaries.get(str(featured.get("id")), {})
+    )
+    situation = None if event_messages else soccer_situation(featured)
+    return [score, *event_messages, situation]
 
 
-def print_world_cup(events, table):
-    print(fixed_title(world_cup_messages(events, table)))
+def print_world_cup(events, table, summaries):
+    print(fixed_title(world_cup_messages(events, table, summaries)))
     print("---")
     print("当前频道：世界杯")
     print("---")
@@ -338,6 +443,11 @@ def print_world_cup(events, table):
     else:
         for event in events:
             print(escape_menu(soccer_title(event)))
+            key_events = all_key_event_messages(summaries.get(str(event.get("id")), {}))
+            if key_events:
+                print("--关键事件")
+                for message in key_events:
+                    print(f"----{escape_menu(message)}")
             for outlook in outlook_lines(event, table):
                 print(f"--{escape_menu(outlook)}")
 
@@ -427,10 +537,12 @@ def main():
         else:
             cached = load_cache(channel)
             if cached is None:
-                events, table = fetch_world_cup()
-                cached = {"events": events, "table": table}
+                events, table, summaries = fetch_world_cup()
+                cached = {"events": events, "table": table, "summaries": summaries}
                 save_cache(channel, cached)
-            print_world_cup(cached["events"], cached["table"])
+            print_world_cup(
+                cached["events"], cached["table"], cached.get("summaries", {})
+            )
     except Exception as exc:
         print("比分暂不可用")
         print("---")
