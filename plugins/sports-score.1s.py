@@ -18,9 +18,11 @@ STATE_DIR = Path(os.environ.get("SPORTS_ISLAND_STATE_DIR", DEFAULT_STATE_DIR))
 STATE_FILE = STATE_DIR / "channel"
 CACHE_FILE = STATE_DIR / "score-cache.json"
 SCRIPT_PATH = Path(__file__).resolve()
-TITLE_WIDTH = 24
+TITLE_WIDTH = 20
 MESSAGE_SECONDS = 10
 SCROLL_PAUSE_SECONDS = 2
+MARQUEE_SEPARATOR = " · "
+FIXED_SPACE = "\u2800"
 DATA_CACHE_SECONDS = 30
 TITLE_FONT = "Menlo"
 TITLE_FONT_SIZE = 13
@@ -118,33 +120,44 @@ def visual_slice(text, start, width):
     return "".join(result), used
 
 
-def fixed_title(messages):
+def title_duration(message):
+    width = visual_width(message)
+    if width <= TITLE_WIDTH:
+        return MESSAGE_SECONDS
+    return SCROLL_PAUSE_SECONDS + visual_width(message + MARQUEE_SEPARATOR)
+
+
+def marquee_frame(message, phase):
+    width = visual_width(message)
+    if width <= TITLE_WIDTH:
+        return message, width
+
+    stream = message + MARQUEE_SEPARATOR
+    stream_width = visual_width(stream)
+    offset = max(0, phase - SCROLL_PAUSE_SECONDS) % stream_width
+    repeated = stream * 3
+    return visual_slice(repeated, offset, TITLE_WIDTH)
+
+
+def fixed_title(messages, now=None):
     messages = [message for message in messages if message]
     if not messages:
         messages = ["比分暂不可用"]
 
-    cycle = int(time.time()) // MESSAGE_SECONDS
-    message = messages[cycle % len(messages)]
-    width = visual_width(message)
+    durations = [title_duration(message) for message in messages]
+    schedule_duration = sum(durations)
+    cursor = int(time.time() if now is None else now) % schedule_duration
+    message = messages[0]
+    phase = 0
+    for candidate, duration in zip(messages, durations):
+        if cursor < duration:
+            message = candidate
+            phase = cursor
+            break
+        cursor -= duration
 
-    if width <= TITLE_WIDTH:
-        visible = message
-        used = width
-    else:
-        scroll_range = width - TITLE_WIDTH
-        scroll_tick = int(time.time()) % MESSAGE_SECONDS
-        if scroll_tick < SCROLL_PAUSE_SECONDS:
-            offset = 0
-        elif scroll_tick >= MESSAGE_SECONDS - SCROLL_PAUSE_SECONDS:
-            offset = scroll_range
-        else:
-            progress = (scroll_tick - SCROLL_PAUSE_SECONDS) / (
-                MESSAGE_SECONDS - SCROLL_PAUSE_SECONDS * 2 - 1
-            )
-            offset = round(scroll_range * progress)
-        visible, used = visual_slice(message, offset, TITLE_WIDTH)
-
-    padding = "\u2007" * max(0, TITLE_WIDTH - used)
+    visible, used = marquee_frame(message, phase)
+    padding = FIXED_SPACE * max(0, TITLE_WIDTH - used)
     return f"{visible}{padding} | font={TITLE_FONT} size={TITLE_FONT_SIZE}"
 
 
